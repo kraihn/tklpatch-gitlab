@@ -1,0 +1,291 @@
+#!/bin/bash -ex
+install()
+{
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get -y \
+        -o DPkg::Options::=--force-confdef \
+        -o DPkg::Options::=--force-confold \
+        install $@
+}
+
+# Inputs
+IP=`ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 | awk '{ print $1}'`
+read -p "FQDN: " FQDN
+read -p "Hostname: " HOSTNAME
+
+# Set Hostname
+if [ -z "$HOSTNAME" ]
+then
+	HOSTNAME=gitlab
+fi
+
+dbpass=a
+dbpassconfirm=z
+while [ $dbpass != $dbpassconfirm ]
+do
+        read -s -p "MySQL root password:" dbpass
+        echo""
+        read -s -p "MySQL root password confirm:" dbpassconfirm
+        echo""
+	if [ -z "$dbpass" ]
+	then
+		dbpass=a
+	fi
+	if [ -z "$dbpassconfirm" ]
+	then
+		dbpassconfirm=z
+	fi
+
+	if [ ${#dbpass} -lt 8 ]
+	then
+		echo "Password isn't long enough. Minimum length is 8 characters."
+		dbpass=a
+		dbpassconfirm=z
+		continue
+	fi
+
+	if [ $dbpass != $dbpassconfirm ]
+    then
+        echo "Passwords do not match. Please try again."
+    	dbpass=a
+		dbpassconfirm=z
+	fi
+done
+
+# Setup
+hostname "$HOSTNAME"
+echo "$HOSTNAME" > /etc/hostname
+sed -i "s|127.0.1.1 \(.*\)|127.0.1.1 $HOSTNAME|" /etc/hosts
+echo "127.0.0.1        $FQDN" >> /etc/hosts
+
+
+# GITLAB AWESOMENESS!!
+
+## 1. Packages / Dependencies
+
+echo "deb http://backports.debian.org/debian-backports squeeze-backports main" >> /etc/apt/sources.list.d/sources.list
+nginx=stable # use nginx=development for latest development version
+echo "deb http://ppa.launchpad.net/nginx/$nginx/ubuntu lucid main" > /etc/apt/sources.list.d/nginx-$nginx-lucid.list
+apt-key adv --keyserver keyserver.ubuntu.com --recv-keys C300EE8C
+apt-get update 
+
+### Install MySQL and set password
+install mysql-server mysql-client libmysqlclient-dev
+
+### Install GitLab required packages
+install sudo vim python libcrypt-passwdmd5-perl build-essential zlib1g-dev libyaml-dev libssl-dev libgdbm-dev libreadline-dev libncurses5-dev libffi-dev curl git-core openssh-server postfix checkinstall libxml2-dev libxslt-dev libcurl4-openssl-dev libicu-dev
+
+### Install Redis-server
+sudo apt-get -t squeeze-backports install redis-server
+
+### Make sure system is up-to-date:
+sudo apt-get update
+sudo apt-get upgrade -y
+
+### Python Shortcut
+sudo ln -s /usr/bin/python /usr/bin/python2
+
+GITLABDB=`md5pass Password22Z | sed 's/[^a-zA-Z0-9]//g'`
+
+## 1.B Configure
+
+
+## 2. Ruby
+
+### Download and compile it
+mkdir /tmp/ruby && cd /tmp/ruby
+curl --progress http://ftp.ruby-lang.org/pub/ruby/1.9/ruby-1.9.3-p327.tar.gz | tar xz
+cd ruby-1.9.3-p327
+./configure
+make
+sudo make install
+
+### Install the Bundler Gem
+sudo gem install bundler
+
+
+## 3. System Users
+
+### Create a user for Git and Gitolite:
+sudo adduser \
+  --system \
+  --shell /bin/sh \
+  --gecos 'Git Version Control' \
+  --group \
+  --disabled-password \
+  --home /home/git \
+  git
+
+### Create a user for GitLab:
+sudo adduser --disabled-login --gecos 'GitLab' gitlab
+##### Add it to the git group
+sudo usermod -a -G git gitlab
+##### Generate the SSH key
+sudo -u gitlab -H ssh-keygen -q -N '' -t rsa -f /home/gitlab/.ssh/id_rsa
+
+
+
+## 4. Gitolite
+
+### Clone GitLab's fork of the Gitolite source code:
+cd /home/git
+sudo -u git -H git clone -b gl-v320 https://github.com/gitlabhq/gitolite.git /home/git/gitolite
+
+
+### Setup Gitolite with GitLab as its admin:
+#### Important Note: GitLab assumes full and unshared control over this Gitolite installation.
+#### Add Gitolite scripts to $PATH
+sudo -u git -H mkdir /home/git/bin
+sudo -u git -H sh -c 'printf "%b\n%b\n" "PATH=\$PATH:/home/git/bin" "export PATH" >> /home/git/.profile'
+sudo -u git -H sh -c 'gitolite/install -ln /home/git/bin'
+
+#### Copy the gitlab user's (public) SSH key ...
+sudo cp /home/gitlab/.ssh/id_rsa.pub /home/git/gitlab.pub
+sudo chmod 0444 /home/git/gitlab.pub
+
+#### ... and use it as the admin key for the Gitolite setup
+sudo -u git -H sh -c "PATH=/home/git/bin:$PATH; gitolite setup -pk /home/git/gitlab.pub"
+
+### Fix the directory permissions for the configuration directory:
+#### Make sure the Gitolite config dir is owned by git
+sudo chmod 750 /home/git/.gitolite/
+sudo chown -R git:git /home/git/.gitolite/
+
+### Fix the directory permissions for the repositories:
+#### Make sure the repositories dir is owned by git and it stays that way
+sudo chmod -R ug+rwXs,o-rwx /home/git/repositories/
+sudo chown -R git:git /home/git/repositories/
+
+### Add domains to list to the list of known hosts
+#sudo -u gitlab -H ssh git@localhost
+#sudo -u gitlab -H ssh git@"$HOSTNAME"
+#sudo -u gitlab -H ssh git@"$FQDN"
+
+### Test if everything works so far
+#### Clone the admin repo so SSH adds localhost to known_hosts ...
+##### ... and to be sure your users have access to Gitolite
+#sudo -u gitlab -H git clone git@localhost:gitolite-admin.git /tmp/gitolite-admin
+##### If it succeeded without errors you can remove the cloned repo
+#sudo rm -rf /tmp/gitolite-admin
+#### Important Note: If you can't clone the gitolite-admin repository: DO NOT PROCEED WITH INSTALLATION! Check the Trouble Shooting Guide and make sure you have followed all of the above steps carefully.
+
+
+## 5. Database
+mysql -u root -e "CREATE USER gitlab@localhost IDENTIFIED BY '"$GITLABDB"'"
+mysql -u root -e "CREATE DATABASE IF NOT EXISTS gitlabhq_production DEFAULT CHARACTER SET utf8 COLLATE utf8_unicode_ci"
+mysql -u root -e "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON gitlabhq_production.* TO 'gitlab'@'localhost'"
+
+
+## 6. GitLab
+
+#### We'll install GitLab into home directory of the user "gitlab"
+cd /home/gitlab
+
+
+### Clone the source
+
+#### Clone GitLab repository
+sudo -u gitlab -H git clone https://github.com/gitlabhq/gitlabhq.git gitlab
+#### Go to gitlab dir 
+cd /home/gitlab/gitlab
+#### Checkout to stable release
+sudo -u gitlab -H git checkout 4-2-stable
+
+
+### Configure it
+
+cd /home/gitlab/gitlab
+#### Copy the example GitLab config
+sudo -u gitlab -H cp config/gitlab.yml.example config/gitlab.yml
+#### Make sure to change "localhost" to the fully-qualified domain name of your
+#### host serving GitLab where necessary
+#sudo -u gitlab -H vim config/gitlab.yml
+sudo -u gitlab -H sed -i 's/localhost/'"$FQDN"'/g' config/gitlab.yml
+#### Make sure GitLab can write to the log/ and tmp/ directories
+sudo chown -R gitlab log/
+sudo chown -R gitlab tmp/
+sudo chmod -R u+rwX  log/
+sudo chmod -R u+rwX  tmp/
+#### Make directory for satellites
+sudo -u gitlab -H mkdir /home/gitlab/gitlab-satellites
+#### Copy the example Unicorn config
+sudo -u gitlab -H cp config/unicorn.rb.example config/unicorn.rb
+
+
+### Configure GitLab DB settings
+#### Mysql
+sudo -u gitlab cp config/database.yml.mysql config/database.yml
+sudo -u gitlab sed -i 's/username: root/username: gitlab/g' config/database.yml
+sudo -u gitlab sed -i 's/secure password/'"$GITLABDB"'/g' config/database.yml
+
+### Install Gems
+cd /home/gitlab/gitlab
+sudo gem install charlock_holmes --version '0.6.9'
+#### For MySQL (note, the option says "without")
+sudo -u gitlab -H bundle install --deployment --without development test postgres
+
+
+### Confirgure Git
+sudo -u gitlab -H git config --global user.name "GitLab"
+sudo -u gitlab -H git config --global user.email "gitlab@$FQDN"
+
+
+### Setup GitLab Hooks
+sudo cp ./lib/hooks/post-receive /home/git/.gitolite/hooks/common/post-receive
+sudo chown git:git /home/git/.gitolite/hooks/common/post-receive
+
+
+### Initialise Database and Activate Advanced Features
+sudo -u gitlab -H bundle exec rake gitlab:setup RAILS_ENV=production
+
+
+### Install Init Script
+#### Download the init script (will be /etc/init.d/gitlab):
+sudo curl --output /etc/init.d/gitlab https://raw.github.com/gitlabhq/gitlab-recipes/4-2-stable/init.d/gitlab
+sudo chmod +x /etc/init.d/gitlab
+#### Make GitLab start on boot:
+sudo update-rc.d gitlab defaults 21
+
+
+### Check Application Status
+#### Check if GitLab and its environment is configured correctly:
+sudo -u gitlab -H bundle exec rake gitlab:env:info RAILS_ENV=production
+#### To make sure you didn't miss anything run a more thorough check with:
+sudo -u gitlab -H bundle exec rake gitlab:check RAILS_ENV=production
+
+
+### Start Your GitLab Instance
+sudo service gitlab start
+
+
+## 7. Nginx
+
+### Installation
+sudo apt-get install nginx -y
+
+### Site Configuration
+#### Download an example site config:
+sudo curl --output /etc/nginx/sites-available/gitlab https://raw.github.com/gitlabhq/gitlab-recipes/4-2-stable/nginx/gitlab
+sudo ln -s /etc/nginx/sites-available/gitlab /etc/nginx/sites-enabled/gitlab
+sudo sed -i 's/YOUR_SERVER_IP/'"$IP"'/g' /etc/nginx/sites-enabled/gitlab
+sudo sed -i 's/default_server//g' /etc/nginx/sites-enabled/gitlab
+sudo sed -i 's/YOUR_SERVER_FQDN/'"$FQDN"'/g' /etc/nginx/sites-enabled/gitlab
+sudo rm /etc/nginx/sites-enabled/default
+
+
+#### Make sure to edit the config file to match your setup:
+# Change **YOUR_SERVER_IP** and **YOUR_SERVER_FQDN**
+# to the IP address and fully-qualified domain name
+# of your host serving GitLab
+## sudo vim /etc/nginx/sites-enabled/gitlab
+
+### Restart
+sudo /etc/init.d/nginx restart
+
+mysqladmin -u root password "$dbpass"
+
+sudo -u gitlab -H ssh git@localhost
+sudo -u gitlab -H ssh git@"$HOSTNAME"
+sudo -u gitlab -H ssh git@"$FQDN"
+
+sudo reboot
